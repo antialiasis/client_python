@@ -303,6 +303,13 @@ class TestMetricWrapper(unittest.TestCase):
         self.assertRaises(ValueError, Counter, 'c', '', labelnames=['__reserved'])
         self.assertRaises(ValueError, Summary, 'c', '', labelnames=['quantile'])
 
+    def test_empty_labels_list(self):
+        h = Histogram('h', 'help', [], registry=self.registry)
+        self.assertEqual(0, self.registry.get_sample_value('h_sum'))
+
+    def test_wrapped_original_class(self):
+        self.assertEqual(Counter.__wrapped__, Counter('foo', 'bar').__class__)
+
 
 class TestMetricFamilies(unittest.TestCase):
     def setUp(self):
@@ -381,6 +388,17 @@ class TestMetricFamilies(unittest.TestCase):
         self.assertRaises(ValueError, HistogramMetricFamily, 'h', 'help', buckets={}, labels=['a'])
         self.assertRaises(ValueError, HistogramMetricFamily, 'h', 'help', buckets={}, sum_value=1, labels=['a'])
         self.assertRaises(KeyError, HistogramMetricFamily, 'h', 'help', buckets={}, sum_value=1)
+
+    def test_labelnames(self):
+        cmf = CounterMetricFamily('c', 'help', labels=iter(['a']))
+        self.assertEqual(('a',), cmf._labelnames)
+        gmf = GaugeMetricFamily('g', 'help', labels=iter(['a']))
+        self.assertEqual(('a',), gmf._labelnames)
+        smf = SummaryMetricFamily('s', 'help', labels=iter(['a']))
+        self.assertEqual(('a',), smf._labelnames)
+        hmf = HistogramMetricFamily('h', 'help', labels=iter(['a']))
+        self.assertEqual(('a',), hmf._labelnames)
+
 
 class TestCollectorRegistry(unittest.TestCase):
     def test_duplicate_metrics_raises(self):

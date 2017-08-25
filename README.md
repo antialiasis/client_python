@@ -206,6 +206,13 @@ other processes, for example:
 ProcessCollector(namespace='mydaemon', pid=lambda: open('/var/run/daemon.pid').read())
 ```
 
+### Platform Collector
+
+The client also automatically exports some metadata about Python. If using Jython,
+metadata about the JVM in use is also included. This information is available as 
+labels on the `python_info` metric. The value of the metric is 1, since it is the 
+labels that carry information.
+
 ## Exporting
 
 There are several options for exporting metrics.
@@ -409,7 +416,6 @@ This comes with a number of limitations:
 - Custom collectors do not work (e.g. cpu and memory metrics)
 - The pushgateway cannot be used
 - Gauges cannot use the `pid` label
-- Gunicorn's `preload_app` feature and equivalents are not supported
 
 There's several steps to getting this working:
 
@@ -421,8 +427,9 @@ between Gunicorn runs (before startup is recommended).
 
 Put the following in the config file:
 ```python
-def worker_exit(server, worker):
-    from prometheus_client import multiprocess
+from prometheus_client import multiprocess
+
+def child_exit(server, worker):
     multiprocess.mark_process_dead(worker.pid)
 ```
 
@@ -465,14 +472,14 @@ Gauges have several modes they can run in, which can be selected with the
 
 ## Parser
 
-The Python client supports parsing the Promeheus text format.
+The Python client supports parsing the Prometheus text format.
 This is intended for advanced use cases where you have servers
 exposing Prometheus metrics and need to get them into some other
 system.
 
 ```python
 from prometheus_client.parser import text_string_to_metric_families
-for family in text_string_to_metric_families("my_gauge 1.0\n"):
+for family in text_string_to_metric_families(u"my_gauge 1.0\n"):
   for sample in family.samples:
     print("Name: {0} Labels: {1} Value: {2}".format(*sample))
 ```

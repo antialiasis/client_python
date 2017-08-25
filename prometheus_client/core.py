@@ -187,7 +187,7 @@ class CounterMetricFamily(Metric):
             raise ValueError('Can only specify at most one of value and labels.')
         if labels is None:
           labels = []
-        self._labelnames = labels
+        self._labelnames = tuple(labels)
         if value is not None:
           self.add_metric([], value)
 
@@ -212,7 +212,7 @@ class GaugeMetricFamily(Metric):
             raise ValueError('Can only specify at most one of value and labels.')
         if labels is None:
           labels = []
-        self._labelnames = labels
+        self._labelnames = tuple(labels)
         if value is not None:
           self.add_metric([], value)
 
@@ -239,7 +239,7 @@ class SummaryMetricFamily(Metric):
             raise ValueError('Can only specify at most one of value and labels.')
         if labels is None:
           labels = []
-        self._labelnames = labels
+        self._labelnames = tuple(labels)
         if count_value is not None:
           self.add_metric([], count_value, sum_value)
 
@@ -268,7 +268,7 @@ class HistogramMetricFamily(Metric):
             raise ValueError('Can only specify at most one of buckets and labels.')
         if labels is None:
           labels = []
-        self._labelnames = labels
+        self._labelnames = tuple(labels)
         if buckets is not None:
           self.add_metric([], buckets, sum_value)
 
@@ -309,17 +309,19 @@ class _MutexValue(object):
       with self._lock:
           return self._value
 
+
 class _MmapedDict(object):
     """A dict of doubles, backed by an mmapped file.
 
     The file starts with a 4 byte int, indicating how much of it is used.
     Then 4 bytes of padding.
     There's then a number of entries, consisting of a 4 byte int which is the
-    side of the next field, a utf-8 encoded string key, padding to a 8 byte
+    size of the next field, a utf-8 encoded string key, padding to a 8 byte
     alignment, and then a 8 byte float which is the value.
+
+    Not thread safe.
     """
     def __init__(self, filename):
-        self._lock = Lock()
         self._f = open(filename, 'a+b')
         if os.fstat(self._f.fileno()).st_size == 0:
             self._f.truncate(_INITIAL_MMAP_SIZE)
@@ -343,7 +345,7 @@ class _MmapedDict(object):
         value = struct.pack('i{0}sd'.format(len(padded)).encode(), len(encoded), padded, 0.0)
         while self._used + len(value) > self._capacity:
             self._capacity *= 2
-            self._f.truncate(self._capacity * 2)
+            self._f.truncate(self._capacity)
             self._m = mmap.mmap(self._f.fileno(), self._capacity)
         self._m[self._used:self._used + len(value)] = value
 
@@ -371,17 +373,15 @@ class _MmapedDict(object):
             yield k, v
 
     def read_value(self, key):
-        with self._lock:
-            if key not in self._positions:
-                self._init_value(key)
+        if key not in self._positions:
+            self._init_value(key)
         pos = self._positions[key]
         # We assume that reading from an 8 byte aligned value is atomic
         return struct.unpack_from(b'd', self._m, pos)[0]
 
     def write_value(self, key, value):
-        with self._lock:
-            if key not in self._positions:
-                self._init_value(key)
+        if key not in self._positions:
+            self._init_value(key)
         pos = self._positions[key]
         # We assume that writing to an 8 byte aligned value is atomic
         struct.pack_into(b'd', self._m, pos, value)
@@ -392,10 +392,13 @@ class _MmapedDict(object):
             self._f = None
 
 
-def _MultiProcessValue(__pid=os.getpid()):
-    pid = __pid
+def _MultiProcessValue(_pidFunc=os.getpid):
     files = {}
-    files_lock = Lock()
+    values = []
+    # Use a single global lock when in multi-processing mode
+    # as we presume this means there is no threading going on.
+    # This avoids the need to also have mutexes in __MmapDict.
+    lock = Lock()
 
     class _MmapedValue(object):
         '''A float protected by a mutex backed by a per-process mmaped file.'''
@@ -403,32 +406,51 @@ def _MultiProcessValue(__pid=os.getpid()):
         _multiprocess = True
 
         def __init__(self, typ, metric_name, name, labelnames, labelvalues, multiprocess_mode='', **kwargs):
+            self._params = typ, metric_name, name, labelnames, labelvalues, multiprocess_mode
+            with lock:
+                self.__reset()
+                values.append(self)
+
+
+        def __reset(self):
+            self._pid = _pidFunc()
+            typ, metric_name, name, labelnames, labelvalues, multiprocess_mode = self._params
             if typ == 'gauge':
                 file_prefix = typ + '_' +  multiprocess_mode
             else:
                 file_prefix = typ
-            with files_lock:
-                if file_prefix not in files:
-                    filename = os.path.join(
-                            os.environ['prometheus_multiproc_dir'], '{0}_{1}.db'.format(file_prefix, pid))
-                    files[file_prefix] = _MmapedDict(filename)
+            if file_prefix not in files:
+                filename = os.path.join(
+                        os.environ['prometheus_multiproc_dir'], '{0}_{1}.db'.format(file_prefix, self._pid))
+                files[file_prefix] = _MmapedDict(filename)
             self._file = files[file_prefix]
             self._key = json.dumps((metric_name, name, labelnames, labelvalues))
             self._value = self._file.read_value(self._key)
-            self._lock = Lock()
+
+        def __check_for_pid_change(self):
+            if self._pid != _pidFunc():
+                # There has been a fork(), reset all the values.
+                for f in files.values():
+                    f.close()
+                files.clear()
+                for value in values:
+                    value.__reset()
 
         def inc(self, amount):
-            with self._lock:
+            with lock:
+                self.__check_for_pid_change()
                 self._value += amount
                 self._file.write_value(self._key, self._value)
 
         def set(self, value):
-            with self._lock:
+            with lock:
+                self.__check_for_pid_change()
                 self._value = value
                 self._file.write_value(self._key, self._value)
 
         def get(self):
-            with self._lock:
+            with lock:
+                self.__check_for_pid_change()
                 return self._value
 
     return _MmapedValue
@@ -534,9 +556,9 @@ def _MetricWrapper(cls):
                     raise ValueError('Reserved label metric name: ' + l)
                 if l in cls._reserved_labelnames:
                     raise ValueError('Reserved label metric name: ' + l)
-            collector = _LabelWrapper(cls, name, labelnames, **kwargs)
+            collector = _LabelWrapper(cls, full_name, labelnames, **kwargs)
         else:
-            collector = cls(name, labelnames, (), **kwargs)
+            collector = cls(full_name, (), (), **kwargs)
 
         if not _METRIC_NAME_RE.match(full_name):
             raise ValueError('Invalid metric name: ' + full_name)
@@ -556,6 +578,7 @@ def _MetricWrapper(cls):
             registry.register(collector)
         return collector
 
+    init.__wrapped__ = cls
     return init
 
 
